@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "Plasma/Wallpaper",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "",
+                "Name": "Video Wallpaper"
+            }
+        ],
+        "Category": "",
+        "Description": "Minimal hardware-accelerated video wallpaper",
+        "Icon": "preferences-desktop-wallpaper",
+        "Id": "simplevideowallpaper",
+        "License": "GPLv2+",
+        "Name": "Video Wallpaper",
+        "Version": "1.0.0",
+        "Website": ""
+    },
+    "Keywords": ["video", "wallpaper"],
+    "X-KDE-ParentApp": "org.kde.plasmashell",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
