@@ -11,8 +11,7 @@
 
 MpvContext::~MpvContext()
 {
-    if (gl) mpv_render_context_free(gl);
-    if (mpv) mpv_destroy(mpv);
+    if (mpv) mpv_terminate_destroy(mpv);
 }
 
 static void *get_proc(void *, const char *name)
@@ -28,6 +27,13 @@ static void wakeup(void *ctx)
         QMetaObject::invokeMethod(item, "update", Qt::QueuedConnection);
 }
 
+static void events(void *ctx)
+{
+    auto *cb = static_cast<MpvCbCtx *>(ctx);
+    if (auto *item = cb->item.load())
+        QMetaObject::invokeMethod(item, "drainMpvEvents", Qt::QueuedConnection);
+}
+
 class MpvRenderer : public QQuickFramebufferObject::Renderer
 {
     std::shared_ptr<MpvContext> m_ctx;
@@ -38,6 +44,14 @@ class MpvRenderer : public QQuickFramebufferObject::Renderer
 public:
     MpvRenderer(std::shared_ptr<MpvContext> c, std::shared_ptr<MpvCbCtx> cb)
         : m_ctx(std::move(c)), m_cb(std::move(cb)) {}
+
+    ~MpvRenderer() override
+    {
+        if (!m_ctx || !m_ctx->gl) return;
+        mpv_render_context_set_update_callback(m_ctx->gl, nullptr, nullptr);
+        mpv_render_context_free(m_ctx->gl);
+        m_ctx->gl = nullptr;
+    }
 
     void render() override
     {
@@ -116,17 +130,22 @@ MpvItem::MpvItem(QQuickItem *parent)
     mpv_set_option_string(m_ctx->mpv, "keepaspect", "no");
     mpv_set_option_string(m_ctx->mpv, "vo", "libmpv");
     mpv_set_option_string(m_ctx->mpv, "gpu-api", "opengl");
+    mpv_set_option_string(m_ctx->mpv, "load-scripts", "no");
+    mpv_set_option_string(m_ctx->mpv, "osc", "no");
+    mpv_set_option_string(m_ctx->mpv, "input-default-bindings", "no");
+    mpv_set_option_string(m_ctx->mpv, "terminal", "no");
 
     const int init = mpv_initialize(m_ctx->mpv);
     if (init < 0) { qWarning() << "mpv_initialize failed" << init; m_ctx.reset(); return; }
+
+    mpv_set_wakeup_callback(m_ctx->mpv, events, m_cb.get());
 }
 
 MpvItem::~MpvItem()
 {
     m_cb->item.store(nullptr);
     if (!m_ctx) return;
-    if (m_ctx->gl) mpv_render_context_set_update_callback(m_ctx->gl, nullptr, nullptr);
-    if (m_ctx->mpv) mpv_command_string(m_ctx->mpv, "quit");
+    if (m_ctx->mpv) mpv_set_wakeup_callback(m_ctx->mpv, nullptr, nullptr);
 }
 
 QQuickFramebufferObject::Renderer *MpvItem::createRenderer() const
@@ -140,4 +159,17 @@ void MpvItem::setSource(const QString &s)
     m_source = s;
     emit sourceChanged();
     update();
+}
+
+void MpvItem::drainMpvEvents()
+{
+    if (!m_ctx || !m_ctx->mpv) return;
+
+    while (true) {
+        mpv_event *event = mpv_wait_event(m_ctx->mpv, 0);
+        if (event->event_id == MPV_EVENT_NONE)
+            break;
+        if (event->event_id == MPV_EVENT_SHUTDOWN)
+            break;
+    }
 }

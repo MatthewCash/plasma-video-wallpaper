@@ -28,6 +28,7 @@ public:
     QString source() const { return m_source; }
     void setSource(const QString &source);
     Renderer *createRenderer() const override;
+    Q_INVOKABLE void drainMpvEvents();
 signals:
     void sourceChanged();
 private:
