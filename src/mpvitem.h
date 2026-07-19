@@ -2,11 +2,11 @@
 #define MPVITEM_H
 
 #include <QQuickFramebufferObject>
-#include <atomic>
 #include <memory>
 
 struct mpv_handle;
 struct mpv_render_context;
+class MpvEventProxy;
 
 struct MpvContext {
     mpv_handle *mpv = nullptr;
@@ -15,7 +15,7 @@ struct MpvContext {
 };
 
 struct MpvCbCtx {
-    std::atomic<class MpvItem *> item{nullptr};
+    std::weak_ptr<MpvEventProxy> proxy;
 };
 
 class MpvItem : public QQuickFramebufferObject
@@ -35,6 +35,7 @@ private:
     QString m_source;
     std::shared_ptr<MpvContext> m_ctx;
     std::shared_ptr<MpvCbCtx> m_cb;
+    std::shared_ptr<MpvEventProxy> m_proxy;
 };
 
 #endif

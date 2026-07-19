@@ -1,8 +1,9 @@
 #include "mpvitem.h"
 #include <QDebug>
+#include <QObject>
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
-#include <QQuickWindow>
+#include <QPointer>
 #include <QUrl>
 #include <clocale>
 
@@ -14,6 +15,45 @@ MpvContext::~MpvContext()
     if (mpv) mpv_terminate_destroy(mpv);
 }
 
+class MpvEventProxy : public QObject
+{
+public:
+    explicit MpvEventProxy(MpvItem *item)
+        : m_item(item) {}
+
+    void detachItem()
+    {
+        m_item.clear();
+    }
+
+    void requestUpdate()
+    {
+        if (m_item) m_item->update();
+    }
+
+    void drainEvents()
+    {
+        if (m_item) m_item->drainMpvEvents();
+    }
+
+private:
+    QPointer<MpvItem> m_item;
+};
+
+static std::shared_ptr<MpvEventProxy> make_proxy(MpvItem *item)
+{
+    return std::shared_ptr<MpvEventProxy>(new MpvEventProxy(item), [](MpvEventProxy *proxy) {
+        if (!proxy) return;
+        proxy->deleteLater();
+    });
+}
+
+static std::shared_ptr<MpvEventProxy> proxy_from(void *ctx)
+{
+    auto *cb = static_cast<MpvCbCtx *>(ctx);
+    return cb ? cb->proxy.lock() : nullptr;
+}
+
 static void *get_proc(void *, const char *name)
 {
     auto *c = QOpenGLContext::currentContext();
@@ -22,23 +62,24 @@ static void *get_proc(void *, const char *name)
 
 static void wakeup(void *ctx)
 {
-    auto *cb = static_cast<MpvCbCtx *>(ctx);
-    if (auto *item = cb->item.load())
-        QMetaObject::invokeMethod(item, "update", Qt::QueuedConnection);
+    auto proxy = proxy_from(ctx);
+    if (proxy) {
+        QMetaObject::invokeMethod(proxy.get(), [proxy] { proxy->requestUpdate(); }, Qt::QueuedConnection);
+    }
 }
 
 static void events(void *ctx)
 {
-    auto *cb = static_cast<MpvCbCtx *>(ctx);
-    if (auto *item = cb->item.load())
-        QMetaObject::invokeMethod(item, "drainMpvEvents", Qt::QueuedConnection);
+    auto proxy = proxy_from(ctx);
+    if (proxy) {
+        QMetaObject::invokeMethod(proxy.get(), [proxy] { proxy->drainEvents(); }, Qt::QueuedConnection);
+    }
 }
 
 class MpvRenderer : public QQuickFramebufferObject::Renderer
 {
     std::shared_ptr<MpvContext> m_ctx;
     std::shared_ptr<MpvCbCtx> m_cb;
-    QQuickFramebufferObject *m_item = nullptr;
     QString m_source;
     QString m_loadedSource;
 public:
@@ -56,8 +97,6 @@ public:
     void render() override
     {
         if (!m_ctx || !m_ctx->mpv) return;
-        auto *item = static_cast<MpvItem *>(m_item);
-        if (!item || !item->window()) return;
         auto *fbo = framebufferObject();
         if (!fbo) return;
 
@@ -90,11 +129,13 @@ public:
             m_loadedSource = m_source;
         }
 
-        qreal dpr = item->window()->devicePixelRatio();
+        const QSize size = fbo->size();
+        if (size.isEmpty()) return;
+
         mpv_opengl_fbo fbo_{
             .fbo = static_cast<int>(fbo->handle()),
-            .w = static_cast<int>(item->width() * dpr),
-            .h = static_cast<int>(item->height() * dpr),
+            .w = size.width(),
+            .h = size.height(),
             .internal_format = 0};
         int flip = 0;
         mpv_render_param p[] = {
@@ -107,7 +148,6 @@ public:
 
     void synchronize(QQuickFramebufferObject *item) override
     {
-        m_item = item;
         m_source = static_cast<MpvItem *>(item)->source();
     }
 };
@@ -117,8 +157,9 @@ MpvItem::MpvItem(QQuickItem *parent)
 {
     setlocale(LC_NUMERIC, "C");
 
+    m_proxy = make_proxy(this);
     m_cb = std::make_shared<MpvCbCtx>();
-    m_cb->item.store(this);
+    m_cb->proxy = m_proxy;
 
     m_ctx = std::make_shared<MpvContext>();
     m_ctx->mpv = mpv_create();
@@ -143,9 +184,11 @@ MpvItem::MpvItem(QQuickItem *parent)
 
 MpvItem::~MpvItem()
 {
-    m_cb->item.store(nullptr);
+    if (m_proxy) m_proxy->detachItem();
     if (!m_ctx) return;
     if (m_ctx->mpv) mpv_set_wakeup_callback(m_ctx->mpv, nullptr, nullptr);
+    if (m_cb) m_cb->proxy.reset();
+    m_proxy.reset();
 }
 
 QQuickFramebufferObject::Renderer *MpvItem::createRenderer() const
