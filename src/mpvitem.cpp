@@ -1,17 +1,23 @@
 #include "mpvitem.h"
+#include <QCoreApplication>
 #include <QDebug>
+#include <QGuiApplication>
 #include <QObject>
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
 #include <QPointer>
+#include <QThread>
 #include <QUrl>
 #include <clocale>
 
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
 
+static constexpr uint64_t HwdecProperty = 1;
+
 MpvContext::~MpvContext()
 {
+    Q_ASSERT(!gl);
     if (mpv) mpv_terminate_destroy(mpv);
 }
 
@@ -44,7 +50,10 @@ static std::shared_ptr<MpvEventProxy> make_proxy(MpvItem *item)
 {
     return std::shared_ptr<MpvEventProxy>(new MpvEventProxy(item), [](MpvEventProxy *proxy) {
         if (!proxy) return;
-        proxy->deleteLater();
+        if (QThread::currentThread() == proxy->thread())
+            delete proxy;
+        else
+            proxy->deleteLater();
     });
 }
 
@@ -88,10 +97,16 @@ public:
 
     ~MpvRenderer() override
     {
-        if (!m_ctx || !m_ctx->gl) return;
-        mpv_render_context_set_update_callback(m_ctx->gl, nullptr, nullptr);
-        mpv_render_context_free(m_ctx->gl);
-        m_ctx->gl = nullptr;
+        if (m_ctx && m_ctx->gl) {
+            mpv_render_context_set_update_callback(m_ctx->gl, nullptr, nullptr);
+            mpv_render_context_free(m_ctx->gl);
+            m_ctx->gl = nullptr;
+        }
+
+        auto context = std::move(m_ctx);
+        QMetaObject::invokeMethod(QCoreApplication::instance(),
+            [context = std::move(context)]() mutable { context.reset(); },
+            Qt::QueuedConnection);
     }
 
     void render() override
@@ -102,10 +117,13 @@ public:
 
         if (!m_ctx->gl) {
             mpv_opengl_init_params gl{get_proc, nullptr};
-            mpv_render_param par[] = {
+            mpv_render_param par[4] = {
                 {MPV_RENDER_PARAM_API_TYPE, (void *)MPV_RENDER_API_TYPE_OPENGL},
-                {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl},
-                {MPV_RENDER_PARAM_INVALID, nullptr}};
+                {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl}};
+            int param = 2;
+            if (m_ctx->wlDisplay)
+                par[param++] = {MPV_RENDER_PARAM_WL_DISPLAY, m_ctx->wlDisplay};
+            par[param] = {MPV_RENDER_PARAM_INVALID, nullptr};
 
             const int result = mpv_render_context_create(&m_ctx->gl, m_ctx->mpv, par);
             if (result < 0) {
@@ -162,10 +180,15 @@ MpvItem::MpvItem(QQuickItem *parent)
     m_cb->proxy = m_proxy;
 
     m_ctx = std::make_shared<MpvContext>();
+    if (auto *wayland = qGuiApp->nativeInterface<QNativeInterface::QWaylandApplication>())
+        m_ctx->wlDisplay = wayland->display();
+    else
+        qWarning() << "Wayland display unavailable; direct VA-API interop is disabled";
+
     m_ctx->mpv = mpv_create();
     if (!m_ctx->mpv) { qWarning() << "mpv_create failed"; m_ctx.reset(); return; }
 
-    mpv_set_option_string(m_ctx->mpv, "hwdec", "auto-safe");
+    mpv_set_option_string(m_ctx->mpv, "hwdec", "vaapi");
     mpv_set_option_string(m_ctx->mpv, "loop", "inf");
     mpv_set_option_string(m_ctx->mpv, "audio", "no");
     mpv_set_option_string(m_ctx->mpv, "keepaspect", "no");
@@ -179,16 +202,40 @@ MpvItem::MpvItem(QQuickItem *parent)
     const int init = mpv_initialize(m_ctx->mpv);
     if (init < 0) { qWarning() << "mpv_initialize failed" << init; m_ctx.reset(); return; }
 
+    const int observe = mpv_observe_property(m_ctx->mpv, HwdecProperty,
+                                             "hwdec-current", MPV_FORMAT_STRING);
+    if (observe < 0)
+        qWarning() << "Failed to observe mpv hardware decoder" << mpv_error_string(observe);
+
     mpv_set_wakeup_callback(m_ctx->mpv, events, m_cb.get());
+
+    connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
+            this, &MpvItem::stopPlayback, Qt::DirectConnection);
 }
 
 MpvItem::~MpvItem()
 {
+    stopPlayback();
     if (m_proxy) m_proxy->detachItem();
     if (!m_ctx) return;
     if (m_ctx->mpv) mpv_set_wakeup_callback(m_ctx->mpv, nullptr, nullptr);
-    if (m_cb) m_cb->proxy.reset();
     m_proxy.reset();
+}
+
+void MpvItem::releaseResources()
+{
+    stopPlayback();
+    QQuickFramebufferObject::releaseResources();
+}
+
+void MpvItem::stopPlayback()
+{
+    if (!m_ctx || !m_ctx->mpv) return;
+
+    const char *command[] = {"stop", nullptr};
+    const int result = mpv_command(m_ctx->mpv, command);
+    if (result < 0)
+        qWarning() << "Failed to stop mpv playback" << mpv_error_string(result);
 }
 
 QQuickFramebufferObject::Renderer *MpvItem::createRenderer() const
@@ -214,5 +261,14 @@ void MpvItem::drainMpvEvents()
             break;
         if (event->event_id == MPV_EVENT_SHUTDOWN)
             break;
+        if (event->event_id == MPV_EVENT_PROPERTY_CHANGE &&
+            event->reply_userdata == HwdecProperty) {
+            auto *property = static_cast<mpv_event_property *>(event->data);
+            if (property && property->format == MPV_FORMAT_STRING && property->data) {
+                const char *decoder = *static_cast<char **>(property->data);
+                if (decoder)
+                    qInfo() << "mpv hardware decoder:" << decoder;
+            }
+        }
     }
 }

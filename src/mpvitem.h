@@ -6,11 +6,13 @@
 
 struct mpv_handle;
 struct mpv_render_context;
+struct wl_display;
 class MpvEventProxy;
 
 struct MpvContext {
     mpv_handle *mpv = nullptr;
     mpv_render_context *gl = nullptr;
+    wl_display *wlDisplay = nullptr;
     ~MpvContext();
 };
 
@@ -31,7 +33,11 @@ public:
     Q_INVOKABLE void drainMpvEvents();
 signals:
     void sourceChanged();
+protected:
+    void releaseResources() override;
 private:
+    void stopPlayback();
+
     QString m_source;
     std::shared_ptr<MpvContext> m_ctx;
     std::shared_ptr<MpvCbCtx> m_cb;
