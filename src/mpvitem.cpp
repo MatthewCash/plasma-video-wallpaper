@@ -1,274 +1,390 @@
 #include "mpvitem.h"
+#include "playbacksession.h"
+
 #include <QCoreApplication>
 #include <QDebug>
-#include <QGuiApplication>
-#include <QObject>
+#include <QEvent>
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
-#include <QPointer>
+#include <QOpenGLFunctions>
+#include <QQuickOpenGLUtils>
+#include <QQuickWindow>
+#include <QSocketNotifier>
 #include <QThread>
 #include <QUrl>
-#include <clocale>
-
-#include <mpv/client.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <mpv/render_gl.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <vector>
+#include <stdexcept>
+#include <sys/stat.h>
 
-static constexpr uint64_t HwdecProperty = 1;
-
-MpvContext::~MpvContext()
-{
-    Q_ASSERT(!gl);
-    if (mpv) mpv_terminate_destroy(mpv);
-}
-
-class MpvEventProxy : public QObject
-{
+// Lifetime is deliberately tied to the application, not an item or QML engine.
+// Qt's normal render-loop post routine destroys remaining scene graphs before
+// application QObject children. Workers below do not need Qt events to exit.
+class RuntimeService : public QObject {
+    Q_OBJECT
 public:
-    explicit MpvEventProxy(MpvItem *item)
-        : m_item(item) {}
-
-    void detachItem()
+    explicit RuntimeService(QObject *parent) : QObject(parent), wake(std::make_shared<WakeFd>())
     {
-        m_item.clear();
+        auto *notifier = new QSocketNotifier(wake->fd(), QSocketNotifier::Read, this);
+        connect(notifier, &QSocketNotifier::activated, this, [this] {
+            wake->drain();
+            // A statusChanged handler may destroy an item. Iterate a copy and
+            // re-check membership, without touching a removed pointer.
+            const auto current = items;
+            for (auto *item : current)
+                if (std::find(items.begin(), items.end(), item) != items.end()) item->pollSession();
+            reap();
+        });
+        connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, this, [this] { stop(); }, Qt::DirectConnection);
     }
-
-    void requestUpdate()
+    ~RuntimeService() override
     {
-        if (m_item) m_item->update();
+        stop();
+        for (auto *item : items) item->m_runtime = nullptr;
+        for (auto &session : sessions) {
+            session->join();
+            quarantineIfNeeded(session);
+        }
+        qInfo() << "video wallpaper runtime drained";
     }
-
-    void drainEvents()
+    static RuntimeService *get()
     {
-        if (m_item) m_item->drainMpvEvents();
+        // Constructed only from MpvItem's GUI-thread constructor. qApp owns it.
+        auto *app = QCoreApplication::instance();
+        Q_ASSERT(QThread::currentThread() == app->thread());
+        auto *runtime = app->findChild<RuntimeService *>(QStringLiteral("videoWallpaperRuntime"), Qt::FindDirectChildrenOnly);
+        if (!runtime) {
+            runtime = new RuntimeService(app);
+            runtime->setObjectName(QStringLiteral("videoWallpaperRuntime"));
+        }
+        return runtime;
     }
-
+    std::shared_ptr<PlaybackSession> create()
+    {
+        // Called by Qt's sync phase, while GUI operations (including stop) are
+        // excluded. Callback threads never access this vector or these items.
+        if (stopping) return {};
+        auto session = std::make_shared<PlaybackSession>(wake);
+        sessions.push_back(session);
+        session->start();
+        return session;
+    }
+    void stop()
+    {
+        stopping = true;
+        for (auto &session : sessions) session->retire();
+    }
+    void reap()
+    {
+        for (auto it = sessions.begin(); it != sessions.end();) {
+            if (!(*it)->finished()) { ++it; continue; }
+            (*it)->join();
+            quarantineIfNeeded(*it);
+            it = sessions.erase(it);
+        }
+    }
+    static void quarantineIfNeeded(const std::shared_ptr<PlaybackSession> &session)
+    {
+        if (session->lost()) {
+            qCritical() << "video wallpaper: GL context lost; retaining session" << session->id()
+                        << "until process exit. Restart the host to reclaim it.";
+            // Intentional exceptional leak: freeing GL with another context or
+            // destroying the client before its render context is undefined.
+            // The plugin stays resident through Qt's default PreventUnloadHint.
+            (void)new std::shared_ptr<PlaybackSession>(session);
+        }
+    }
+    std::vector<MpvItem *> items; // GUI thread only
 private:
-    QPointer<MpvItem> m_item;
+    bool stopping = false; // GUI, or synchronization phase with GUI blocked
+    std::shared_ptr<WakeFd> wake;
+    std::vector<std::shared_ptr<PlaybackSession>> sessions;
 };
 
-static std::shared_ptr<MpvEventProxy> make_proxy(MpvItem *item)
+namespace {
+void *getProc(void *, const char *name)
 {
-    return std::shared_ptr<MpvEventProxy>(new MpvEventProxy(item), [](MpvEventProxy *proxy) {
-        if (!proxy) return;
-        if (QThread::currentThread() == proxy->thread())
-            delete proxy;
-        else
-            proxy->deleteLater();
-    });
+    auto *context = QOpenGLContext::currentContext();
+    return context ? reinterpret_cast<void *>(context->getProcAddress(QByteArray(name))) : nullptr;
 }
 
-static std::shared_ptr<MpvEventProxy> proxy_from(void *ctx)
+std::string renderNode()
 {
-    auto *cb = static_cast<MpvCbCtx *>(ctx);
-    return cb ? cb->proxy.lock() : nullptr;
-}
-
-static void *get_proc(void *, const char *name)
-{
-    auto *c = QOpenGLContext::currentContext();
-    return c ? reinterpret_cast<void *>(c->getProcAddress(QByteArray(name))) : nullptr;
-}
-
-static void wakeup(void *ctx)
-{
-    auto proxy = proxy_from(ctx);
-    if (proxy) {
-        QMetaObject::invokeMethod(proxy.get(), [proxy] { proxy->requestUpdate(); }, Qt::QueuedConnection);
+    const EGLDisplay display = eglGetCurrentDisplay();
+    if (display == EGL_NO_DISPLAY || eglGetCurrentContext() == EGL_NO_CONTEXT)
+        throw std::runtime_error("Qt Quick must use OpenGL through EGL for direct VA-API");
+    auto queryDisplay = reinterpret_cast<PFNEGLQUERYDISPLAYATTRIBEXTPROC>(eglGetProcAddress("eglQueryDisplayAttribEXT"));
+    auto queryDevice = reinterpret_cast<PFNEGLQUERYDEVICESTRINGEXTPROC>(eglGetProcAddress("eglQueryDeviceStringEXT"));
+    EGLAttrib device = 0;
+    const char *node = nullptr;
+    if (queryDisplay && queryDevice && queryDisplay(display, EGL_DEVICE_EXT, &device))
+        node = queryDevice(reinterpret_cast<EGLDeviceEXT>(device), EGL_DRM_RENDER_NODE_FILE_EXT);
+    const char *overrideNode = std::getenv("PLASMA_VIDEO_WALLPAPER_RENDER_NODE");
+    if (overrideNode && *overrideNode) {
+        struct stat requested{}, actual{};
+        if (stat(overrideNode, &requested) || !S_ISCHR(requested.st_mode))
+            throw std::runtime_error("invalid PLASMA_VIDEO_WALLPAPER_RENDER_NODE");
+        if (node && (stat(node, &actual) || requested.st_rdev != actual.st_rdev))
+            throw std::runtime_error("configured VA-API device does not match Qt's rendering device");
+        return overrideNode;
     }
+    if (!node || !*node)
+        throw std::runtime_error("EGL did not identify a DRM render node; set PLASMA_VIDEO_WALLPAPER_RENDER_NODE explicitly");
+    return node;
 }
 
-static void events(void *ctx)
-{
-    auto proxy = proxy_from(ctx);
-    if (proxy) {
-        QMetaObject::invokeMethod(proxy.get(), [proxy] { proxy->drainEvents(); }, Qt::QueuedConnection);
-    }
-}
-
-class MpvRenderer : public QQuickFramebufferObject::Renderer
-{
-    std::shared_ptr<MpvContext> m_ctx;
-    std::shared_ptr<MpvCbCtx> m_cb;
-    QString m_source;
-    QString m_loadedSource;
-public:
-    MpvRenderer(std::shared_ptr<MpvContext> c, std::shared_ptr<MpvCbCtx> cb)
-        : m_ctx(std::move(c)), m_cb(std::move(cb)) {}
-
-    ~MpvRenderer() override
+struct ResetGL {
+    ~ResetGL()
     {
-        if (m_ctx && m_ctx->gl) {
-            mpv_render_context_set_update_callback(m_ctx->gl, nullptr, nullptr);
-            mpv_render_context_free(m_ctx->gl);
-            m_ctx->gl = nullptr;
-        }
+        auto *context = QOpenGLContext::currentContext();
+        if (context && context->isValid()) QQuickOpenGLUtils::resetOpenGLState();
+    }
+};
+}
 
-        auto context = std::move(m_ctx);
-        QMetaObject::invokeMethod(QCoreApplication::instance(),
-            [context = std::move(context)]() mutable { context.reset(); },
-            Qt::QueuedConnection);
+class MpvRenderer final : public QQuickFramebufferObject::Renderer {
+public:
+    MpvRenderer(std::shared_ptr<PlaybackSession> session, uint64_t generation)
+        : m_session(std::move(session)), m_generation(generation) {}
+    ~MpvRenderer() override { cleanup(); }
+
+    void synchronize(QQuickFramebufferObject *base) override
+    {
+        auto *item = static_cast<MpvItem *>(base);
+        if (m_generation == item->m_generation) return;
+        cleanup();
+        m_generation = item->m_generation;
+        m_configured = false;
+        m_context = nullptr;
+        m_thread = nullptr;
+        m_session = item->m_runtime ? item->m_runtime->create() : nullptr;
+        item->m_session = m_session;
+        item->sendDesired();
     }
 
     void render() override
     {
-        if (!m_ctx || !m_ctx->mpv) return;
         auto *fbo = framebufferObject();
         if (!fbo) return;
-
-        if (!m_ctx->gl) {
-            mpv_opengl_init_params gl{get_proc, nullptr};
-            mpv_render_param par[4] = {
-                {MPV_RENDER_PARAM_API_TYPE, (void *)MPV_RENDER_API_TYPE_OPENGL},
-                {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl}};
-            int param = 2;
-            if (m_ctx->wlDisplay)
-                par[param++] = {MPV_RENDER_PARAM_WL_DISPLAY, m_ctx->wlDisplay};
-            par[param] = {MPV_RENDER_PARAM_INVALID, nullptr};
-
-            const int result = mpv_render_context_create(&m_ctx->gl, m_ctx->mpv, par);
+        auto *current = QOpenGLContext::currentContext();
+        if (!current || !current->isValid()) { cleanup(); return; }
+        ResetGL reset;
+        auto clear = [current] {
+            current->functions()->glClearColor(0, 0, 0, 1);
+            current->functions()->glClear(GL_COLOR_BUFFER_BIT);
+        };
+        if (!m_session || m_session->stopping()) {
+            cleanup();
+            clear();
+            return;
+        }
+        if (!m_configured) {
+            try {
+                bool software = false;
+#ifdef WALLPAPER_TESTING
+                software = std::getenv("WALLPAPER_TEST_SOFTWARE") != nullptr;
+#endif
+                const auto node = software ? std::string() : renderNode();
+                qInfo() << "video wallpaper session" << m_session->id() << "render node:" << node.c_str();
+                m_session->configure(node, software);
+                m_configured = true;
+            } catch (const std::exception &e) {
+                m_session->fail(e.what());
+            }
+        }
+        if (!m_gl) {
+            int fd = -1;
+            auto *client = m_session->acquireRenderer(fd);
+            if (!client) { clear(); return; }
+            m_context = current;
+            m_thread = QThread::currentThread();
+            m_eglContext = eglGetCurrentContext();
+            m_eglDisplay = eglGetCurrentDisplay();
+            qInfo() << "video wallpaper session" << m_session->id() << "render creating";
+#ifdef WALLPAPER_TESTING
+            if (const char *delay = std::getenv("WALLPAPER_TEST_RENDER_DELAY_MS"))
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(delay)));
+#endif
+            mpv_opengl_init_params init{getProc, nullptr};
+            mpv_opengl_drm_params_v2 drm{-1, 0, 0, nullptr, fd};
+            int advanced = 0;
+            mpv_render_param params[] = {
+                {MPV_RENDER_PARAM_API_TYPE, const_cast<char *>(MPV_RENDER_API_TYPE_OPENGL)},
+                {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &init},
+                {MPV_RENDER_PARAM_ADVANCED_CONTROL, &advanced},
+                {fd >= 0 ? MPV_RENDER_PARAM_DRM_DISPLAY_V2 : MPV_RENDER_PARAM_INVALID, &drm},
+                {MPV_RENDER_PARAM_INVALID, nullptr},
+            };
+            const int result = mpv_render_context_create(&m_gl, client, params);
             if (result < 0) {
-                qWarning() << "Failed to create mpv OpenGL render context" << result;
+                m_session->fail(std::string("render context creation: ") + mpv_error_string(result));
+                cleanup();
+                clear();
                 return;
             }
-
-            mpv_render_context_set_update_callback(m_ctx->gl, wakeup, m_cb.get());
+            mpv_render_context_set_update_callback(m_gl, PlaybackSession::renderUpdate, m_session.get());
+            if (!m_session->rendererReady()) { cleanup(); clear(); return; }
+            qInfo() << "video wallpaper session" << m_session->id() << "render ready";
         }
-
-        if (m_source.isEmpty() && !m_loadedSource.isEmpty()) {
-            const char *c[] = {"stop", nullptr};
-            mpv_command_async(m_ctx->mpv, 0, c);
-            m_loadedSource.clear();
-        } else if (!m_source.isEmpty() && m_source != m_loadedSource) {
-            const QUrl url(m_source);
-            const QString source = url.isLocalFile() ? url.toLocalFile() : m_source;
-            const QByteArray f = source.toUtf8();
-            const char *c[] = {"loadfile", f.constData(), nullptr};
-            mpv_command_async(m_ctx->mpv, 0, c);
-            m_loadedSource = m_source;
+        if (!ownsCurrentContext()) {
+            m_session->fail("render context/thread changed without renderer recreation");
+            cleanup();
+            clear();
+            return;
         }
-
+        mpv_render_context_update(m_gl);
         const QSize size = fbo->size();
-        if (size.isEmpty()) return;
-
-        mpv_opengl_fbo fbo_{
-            .fbo = static_cast<int>(fbo->handle()),
-            .w = size.width(),
-            .h = size.height(),
-            .internal_format = 0};
+        mpv_opengl_fbo target{static_cast<int>(fbo->handle()), size.width(), size.height(), 0};
         int flip = 0;
-        mpv_render_param p[] = {
-            {MPV_RENDER_PARAM_OPENGL_FBO, &fbo_},
+        int block = 0;
+        mpv_render_param params[] = {
+            {MPV_RENDER_PARAM_OPENGL_FBO, &target},
             {MPV_RENDER_PARAM_FLIP_Y, &flip},
-            {MPV_RENDER_PARAM_INVALID, nullptr}};
-        mpv_render_context_render(m_ctx->gl, p);
-        mpv_render_context_report_swap(m_ctx->gl);
+            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &block},
+            {MPV_RENDER_PARAM_INVALID, nullptr},
+        };
+        const int result = mpv_render_context_render(m_gl, params);
+        if (result < 0) m_session->fail(std::string("render: ") + mpv_error_string(result));
+        // An FBO draw is not a window swap; omit the optional report_swap API.
     }
 
-    void synchronize(QQuickFramebufferObject *item) override
+private:
+    bool ownsCurrentContext() const
     {
-        m_source = static_cast<MpvItem *>(item)->source();
+        auto *current = QOpenGLContext::currentContext();
+        return current && current == m_context && current->isValid()
+            && QThread::currentThread() == m_thread
+            && eglGetCurrentContext() == m_eglContext
+            && eglGetCurrentDisplay() == m_eglDisplay;
     }
+    void cleanup()
+    {
+        if (!m_session) return;
+        m_session->retire();
+        bool lost = false;
+        if (m_gl) {
+            // This API explicitly does not need a current OpenGL context.
+            mpv_render_context_set_update_callback(m_gl, nullptr, nullptr);
+            lost = !ownsCurrentContext();
+            if (!lost) {
+                mpv_render_context_free(m_gl);
+                QQuickOpenGLUtils::resetOpenGLState();
+            }
+            m_gl = nullptr;
+        }
+        qInfo() << "video wallpaper session" << m_session->id() << "render released" << !lost;
+        m_session->releaseRenderer(lost);
+        m_session.reset();
+    }
+    std::shared_ptr<PlaybackSession> m_session;
+    mpv_render_context *m_gl = nullptr;
+    QOpenGLContext *m_context = nullptr; // identity only; never dereferenced
+    QThread *m_thread = nullptr;
+    EGLContext m_eglContext = EGL_NO_CONTEXT;
+    EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
+    bool m_configured = false;
+    uint64_t m_generation;
 };
 
-MpvItem::MpvItem(QQuickItem *parent)
-    : QQuickFramebufferObject(parent)
+MpvItem::MpvItem(QQuickItem *parent) : QQuickFramebufferObject(parent), m_runtime(RuntimeService::get())
 {
-    setlocale(LC_NUMERIC, "C");
-
-    m_proxy = make_proxy(this);
-    m_cb = std::make_shared<MpvCbCtx>();
-    m_cb->proxy = m_proxy;
-
-    m_ctx = std::make_shared<MpvContext>();
-    if (auto *wayland = qGuiApp->nativeInterface<QNativeInterface::QWaylandApplication>())
-        m_ctx->wlDisplay = wayland->display();
-    else
-        qWarning() << "Wayland display unavailable; direct VA-API interop is disabled";
-
-    m_ctx->mpv = mpv_create();
-    if (!m_ctx->mpv) { qWarning() << "mpv_create failed"; m_ctx.reset(); return; }
-
-    mpv_set_option_string(m_ctx->mpv, "hwdec", "vaapi");
-    mpv_set_option_string(m_ctx->mpv, "loop", "inf");
-    mpv_set_option_string(m_ctx->mpv, "audio", "no");
-    mpv_set_option_string(m_ctx->mpv, "keepaspect", "no");
-    mpv_set_option_string(m_ctx->mpv, "vo", "libmpv");
-    mpv_set_option_string(m_ctx->mpv, "gpu-api", "opengl");
-    mpv_set_option_string(m_ctx->mpv, "load-scripts", "no");
-    mpv_set_option_string(m_ctx->mpv, "osc", "no");
-    mpv_set_option_string(m_ctx->mpv, "input-default-bindings", "no");
-    mpv_set_option_string(m_ctx->mpv, "terminal", "no");
-
-    const int init = mpv_initialize(m_ctx->mpv);
-    if (init < 0) { qWarning() << "mpv_initialize failed" << init; m_ctx.reset(); return; }
-
-    const int observe = mpv_observe_property(m_ctx->mpv, HwdecProperty,
-                                             "hwdec-current", MPV_FORMAT_STRING);
-    if (observe < 0)
-        qWarning() << "Failed to observe mpv hardware decoder" << mpv_error_string(observe);
-
-    mpv_set_wakeup_callback(m_ctx->mpv, events, m_cb.get());
-
-    connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
-            this, &MpvItem::stopPlayback, Qt::DirectConnection);
+    m_runtime->items.push_back(this);
+    connect(this, &QQuickItem::visibleChanged, this, &MpvItem::sendDesired);
+    connect(this, &QQuickItem::windowChanged, this, &MpvItem::observeWindow);
+    // A parent supplied to the constructor may already belong to a window.
+    observeWindow(window());
 }
-
 MpvItem::~MpvItem()
 {
-    stopPlayback();
-    if (m_proxy) m_proxy->detachItem();
-    if (!m_ctx) return;
-    if (m_ctx->mpv) mpv_set_wakeup_callback(m_ctx->mpv, nullptr, nullptr);
-    m_proxy.reset();
+    // QQuickItem's base destructor emits windowChanged/visibleChanged after
+    // MpvItem's members have been destroyed. QObject's automatic disconnect is
+    // too late for connections targeting a derived method or capturing this.
+    disconnect(this, nullptr, this, nullptr);
+    disconnect(m_visibilityConnection);
+    if (m_observedWindow) m_observedWindow->removeEventFilter(this);
+    retireSession();
+    if (!m_runtime) return;
+    auto &items = m_runtime->items;
+    items.erase(std::remove(items.begin(), items.end(), this), items.end());
 }
-
+void MpvItem::retireSession()
+{
+    if (m_session) m_session->retire();
+    m_session.reset();
+}
 void MpvItem::releaseResources()
 {
-    stopPlayback();
+    retireSession();
     QQuickFramebufferObject::releaseResources();
 }
-
-void MpvItem::stopPlayback()
-{
-    if (!m_ctx || !m_ctx->mpv) return;
-
-    const char *command[] = {"stop", nullptr};
-    const int result = mpv_command(m_ctx->mpv, command);
-    if (result < 0)
-        qWarning() << "Failed to stop mpv playback" << mpv_error_string(result);
-}
-
 QQuickFramebufferObject::Renderer *MpvItem::createRenderer() const
 {
-    return new MpvRenderer(m_ctx, m_cb);
+    if (m_session) m_session->retire();
+    m_session = m_runtime ? m_runtime->create() : nullptr;
+    if (m_session) const_cast<MpvItem *>(this)->sendDesired();
+    return new MpvRenderer(m_session, m_generation);
 }
 
-void MpvItem::setSource(const QString &s)
+void MpvItem::sendDesired()
 {
-    if (m_source == s) return;
-    m_source = s;
+    if (!m_session) return;
+    const QUrl url(m_source);
+    const auto path = (url.isLocalFile() ? url.toLocalFile() : m_source).toUtf8();
+    m_session->setDesired(path.toStdString(), !isVisible() || !window() || !window()->isExposed(), m_revision);
+}
+void MpvItem::observeWindow(QQuickWindow *w)
+{
+    disconnect(m_visibilityConnection);
+    if (m_observedWindow) m_observedWindow->removeEventFilter(this);
+    m_observedWindow = w;
+    if (w) {
+        w->installEventFilter(this);
+        m_visibilityConnection = connect(w, &QWindow::visibleChanged, this, &MpvItem::sendDesired);
+    }
+    sendDesired();
+}
+bool MpvItem::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_observedWindow && event->type() == QEvent::Expose)
+        sendDesired();
+    return QQuickFramebufferObject::eventFilter(watched, event);
+}
+void MpvItem::setSource(const QString &source)
+{
+    if (source == m_source) return;
+    m_source = source;
+    ++m_revision;
+    if (m_session && m_session->stopping()) ++m_generation;
+    sendDesired();
+    update();
     emit sourceChanged();
+}
+void MpvItem::retry()
+{
+    ++m_revision;
+    if (m_session && m_session->stopping()) ++m_generation;
+    sendDesired();
     update();
 }
-
-void MpvItem::drainMpvEvents()
+void MpvItem::pollSession()
 {
-    if (!m_ctx || !m_ctx->mpv) return;
-
-    while (true) {
-        mpv_event *event = mpv_wait_event(m_ctx->mpv, 0);
-        if (event->event_id == MPV_EVENT_NONE)
-            break;
-        if (event->event_id == MPV_EVENT_SHUTDOWN)
-            break;
-        if (event->event_id == MPV_EVENT_PROPERTY_CHANGE &&
-            event->reply_userdata == HwdecProperty) {
-            auto *property = static_cast<mpv_event_property *>(event->data);
-            if (property && property->format == MPV_FORMAT_STRING && property->data) {
-                const char *decoder = *static_cast<char **>(property->data);
-                if (decoder)
-                    qInfo() << "mpv hardware decoder:" << decoder;
-            }
-        }
+    if (!m_session || !m_session->takeUpdate()) return;
+    const auto state = m_session->snapshot();
+    const QString status = QString::fromStdString(state.status);
+    const QString error = QString::fromStdString(state.error);
+    const QString decoder = QString::fromStdString(state.decoder);
+    update();
+    if (m_status != status || m_error != error || m_decoder != decoder) {
+        m_status = status;
+        m_error = error;
+        m_decoder = decoder;
+        emit statusChanged();
     }
 }
+
+#include "mpvitem.moc"

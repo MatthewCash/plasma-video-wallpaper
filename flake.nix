@@ -18,10 +18,12 @@
             pkg-config
           ];
           extraBuildInputs = with pkgs; [
-            mpv
+            mpv-unwrapped
+            libglvnd
             kdePackages.libplasma
             kdePackages.qtdeclarative
           ];
+          cmakeFlags = [ "-DBUILD_TESTING=OFF" ];
 
           meta = with pkgs.lib; {
             description = "Minimal hw-accelerated video wallpaper";
@@ -30,5 +32,12 @@
           };
         };
       });
+      devShells = forAll (system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in {
+          default = pkgs.mkShell {
+            inputsFrom = [ self.packages.${system}.default ];
+            packages = [ pkgs.python3 pkgs.ffmpeg ];
+          };
+        });
     };
 }
